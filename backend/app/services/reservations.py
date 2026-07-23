@@ -1,35 +1,95 @@
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Any, List
+from zoneinfo import ZoneInfo
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
-    """
-    Calculates revenue for a specific month.
-    """
+logger = logging.getLogger(__name__)
 
-    start_date = datetime(year, month, 1)
+DEFAULT_TIMEZONE = "UTC"
+
+
+async def _get_property_timezone(property_id: str, tenant_id: str, session) -> str:
+    """Reads the IANA timezone recorded for a property (properties.timezone)."""
+    from sqlalchemy import text
+
+    result = await session.execute(
+        text(
+            "SELECT timezone FROM properties "
+            "WHERE id = :property_id AND tenant_id = :tenant_id"
+        ),
+        {"property_id": property_id, "tenant_id": tenant_id},
+    )
+    row = result.fetchone()
+    return (row.timezone if row and row.timezone else DEFAULT_TIMEZONE)
+
+
+def month_bounds_utc(year: int, month: int, tz_name: str) -> tuple:
+    """
+    Returns the [start, end) UTC instants of a calendar month *as observed at the
+    property*.
+
+    check_in_date is stored as TIMESTAMPTZ, i.e. an absolute instant. Building the
+    month boundary with a naive datetime made Postgres compare it in UTC, so a
+    stay that begins on 1 March 00:30 in Paris - 29 Feb 23:30 UTC - was counted
+    in February. The client books, invoices and reports in local time, so the
+    month window has to be anchored in the property's timezone and only then
+    converted to UTC for the query.
+    """
+    tz = ZoneInfo(tz_name)
+    start_local = datetime(year, month, 1, tzinfo=tz)
     if month < 12:
-        end_date = datetime(year, month + 1, 1)
+        end_local = datetime(year, month + 1, 1, tzinfo=tz)
     else:
-        end_date = datetime(year + 1, 1, 1)
-        
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+        end_local = datetime(year + 1, 1, 1, tzinfo=tz)
 
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
-        FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+async def calculate_monthly_revenue(
+    property_id: str, tenant_id: str, month: int, year: int, db_session=None
+) -> Decimal:
     """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+    Calculates revenue for a specific month, in the property's local calendar.
+    """
+    from sqlalchemy import text
+
+    from app.core.database_pool import DatabasePool
+
+    async def _run(session):
+        tz_name = await _get_property_timezone(property_id, tenant_id, session)
+        start_utc, end_utc = month_bounds_utc(year, month, tz_name)
+
+        logger.debug(
+            "Querying revenue for %s (tenant %s) in %s: %s -> %s",
+            property_id, tenant_id, tz_name, start_utc, end_utc,
+        )
+
+        query = text("""
+            SELECT SUM(total_amount) AS total
+            FROM reservations
+            WHERE property_id = :property_id
+              AND tenant_id = :tenant_id
+              AND check_in_date >= :start_utc
+              AND check_in_date < :end_utc
+        """)
+        result = await session.execute(query, {
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "start_utc": start_utc,
+            "end_utc": end_utc,
+        })
+        row = result.fetchone()
+        # SUM() over no rows is NULL; Decimal(str(...)) keeps the exact scale.
+        return Decimal(str(row.total)) if row and row.total is not None else Decimal("0")
+
+    if db_session is not None:
+        return await _run(db_session)
+
+    db_pool = DatabasePool()
+    await db_pool.initialize()
+    async with db_pool.get_session() as session:
+        return await _run(session)
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
     """
@@ -86,24 +146,12 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
             raise Exception("Database pool not available")
             
     except Exception as e:
-        print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
-        
-        # Create property-specific mock data for testing when DB is unavailable
-        # This ensures each property shows different figures
-        mock_data = {
-            'prop-001': {'total': '1000.00', 'count': 3},
-            'prop-002': {'total': '4975.50', 'count': 4}, 
-            'prop-003': {'total': '6100.50', 'count': 2},
-            'prop-004': {'total': '1776.50', 'count': 4},
-            'prop-005': {'total': '3256.00', 'count': 3}
-        }
-        
-        mock_property_data = mock_data.get(property_id, {'total': '0.00', 'count': 0})
-        
-        return {
-            "property_id": property_id,
-            "tenant_id": tenant_id, 
-            "total": mock_property_data['total'],
-            "currency": "USD",
-            "count": mock_property_data['count']
-        }
+        # Previously this swallowed every failure and returned hard-coded revenue
+        # figures keyed by property_id. A finance dashboard silently served
+        # fabricated totals whenever the database hiccuped, which is precisely the
+        # "numbers don't match our internal records" the client reported - and it
+        # is indistinguishable from real data at the UI. Surface the failure.
+        logger.exception(
+            "Revenue query failed for %s (tenant: %s)", property_id, tenant_id
+        )
+        raise
