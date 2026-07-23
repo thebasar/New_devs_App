@@ -135,11 +135,24 @@ Both figures match the seeded rows queried directly in Postgres. The same proper
 ID now returns each tenant's own revenue, read from the database, as an exact
 decimal.
 
+## Tests
+
+`backend/tests/test_revenue_regressions.py` — 13 tests, no database or Redis server
+required. The timezone logic is a pure function; the cache path runs against an
+in-memory double that records the keys it is asked for.
+
+```
+docker compose exec backend python -m pytest tests/ -q
+```
+
+They cover: month windows resolving in the property's timezone (including the
+half-open boundary and the 31 March DST transition), two tenants sharing
+`prop-001` never reading each other's cache entry, caching still working within a
+tenant, a missing tenant being refused rather than falling back to an unscoped key,
+and revenue surviving the JSON round trip through Redis as an exact decimal string.
+
 ## What I would do next, with more time
 
-- Regression tests: a cache test asserting two tenants with a shared property ID
-  never read each other's entry, and a timezone test pinning `res-tz-1` to March
-  for a Paris property and to February for a UTC one.
 - `calculate_total_revenue` is unfiltered by date while `calculate_monthly_revenue`
   is timezone-correct; the two should share one windowing helper.
 - Enforce tenant isolation in the database as well. `schema.sql` enables row level
