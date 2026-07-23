@@ -3,10 +3,36 @@ import { SecureAPI } from '../lib/secureApi';
 
 interface RevenueData {
     property_id: string;
-    total_revenue: number;
+    // Exact decimal string from the API (e.g. "2250.000"). Never a JS number:
+    // parsing money into a double loses the exact base-10 value the ledger holds.
+    total_revenue: string;
     currency: string;
     reservations_count: number;
 }
+
+/**
+ * Formats an exact decimal string for display without going through a double.
+ * Rounds half-up to `dp` places using integer string arithmetic, so "333.335"
+ * renders as "333.34" and no value is silently truncated by binary floating point.
+ */
+const formatDecimal = (value: string, dp = 2): string => {
+    const negative = value.trim().startsWith('-');
+    const [intPart, fracPart = ''] = value.trim().replace(/^[-+]/, '').split('.');
+
+    let digits = (intPart + fracPart.padEnd(dp + 1, '0')).replace(/\D/g, '');
+    const cut = intPart.length + dp;
+    const roundUp = Number(digits[cut]) >= 5;
+    digits = digits.slice(0, cut);
+
+    let scaled = BigInt(digits || '0') + (roundUp ? 1n : 0n);
+    let asText = scaled.toString().padStart(dp + 1, '0');
+
+    const whole = asText.slice(0, asText.length - dp) || '0';
+    const frac = dp > 0 ? asText.slice(asText.length - dp) : '';
+
+    const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return `${negative ? '-' : ''}${grouped}${dp > 0 ? '.' + frac : ''}`;
+};
 
 interface RevenueSummaryProps {
     propertyId?: string;
@@ -61,7 +87,11 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
     if (error) return <div className="p-4 text-red-500 bg-red-50 rounded-lg">{error}</div>;
     if (!data) return null;
 
-    const displayTotal = Math.round(data.total_revenue * 100) / 100;
+    // Previously: Math.round(data.total_revenue * 100) / 100 - this multiplied a
+    // double by 100 and rounded, which both introduced binary-float error and
+    // discarded the third decimal that NUMERIC(10,3) stores.
+    const displayTotal = formatDecimal(data.total_revenue, 2);
+    const isRounded = formatDecimal(data.total_revenue, 3) !== `${displayTotal}0`;
 
     return (
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow duration-300">
@@ -78,7 +108,7 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
                         <h2 className="text-sm font-medium text-gray-500 uppercase tracking-wide">Total Revenue</h2>
                         <div className="flex items-baseline gap-2 mt-1">
                             <span className="text-3xl font-bold text-gray-900 tracking-tight">
-                                {data.currency} {displayTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                {data.currency} {displayTotal}
                             </span>
                             {/* Fake trend indicator for premium feel */}
                             <span className="inline-flex items-baseline px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 md:mt-2 lg:mt-0">
@@ -104,7 +134,7 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
 
                 {/* Precision Warning Area */}
                 <div className="mt-4 h-6">
-                    {Math.abs(data.total_revenue - displayTotal) > 0.000001 && showRaw && (
+                    {isRounded && showRaw && (
                         <div className="flex items-center text-xs text-amber-600 bg-amber-50 px-2 py-1 rounded">
                             <svg className="h-4 w-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
